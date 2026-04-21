@@ -16,7 +16,6 @@ const ctx = canvas.getContext('2d');
 let W = canvas.width = window.innerWidth;
 let H = canvas.height = window.innerHeight;
 
-// Seeded LCG — keeps tree shapes stable across frames
 function makeRng(seed) {
   let s = (seed ^ 0x12345678) >>> 0;
   return () => {
@@ -25,63 +24,212 @@ function makeRng(seed) {
   };
 }
 
+// ===== LIFECYCLE =====
+const S_BIRTH     = 0;  // branches grow level by level
+const S_LEAFY     = 1;  // full green canopy
+const S_FLOWERING = 2;  // pink/white/lavender blooms
+const S_FALLING   = 3;  // autumn colours, leaves detach as particles
+const S_BARE      = 4;  // skeleton only
+const S_DYING     = 5;  // lean, desaturate, fade
+const S_DEAD      = 6;  // invisible pause before rebirth
+const S_COUNT     = 7;
+
+// durations in frames (~60fps)
+const S_DUR = [600, 1500, 720, 960, 660, 520, 150];
+
 // ===== TREE =====
-function buildTree(rng, angle, len, depth) {
+// level = distance from root (0 = trunk), treeMaxDepth stored per node for birth culling
+function buildTree(rng, angle, len, depth, treeMaxDepth, level) {
   if (depth <= 0 || len < 2) return null;
   const lf = 0.60 + rng() * 0.15;
   const a1 = angle - (0.25 + rng() * 0.30);
   const a2 = angle + (0.25 + rng() * 0.30);
   const node = {
     angle, len, depth,
+    level, treeMaxDepth,
     swayPhase: rng() * Math.PI * 2,
     swayAmt: 0.06 / Math.sqrt(depth),
     children: [],
     leaves: []
   };
-  const left = buildTree(rng, a1, len * lf, depth - 1);
-  const right = buildTree(rng, a2, len * lf, depth - 1);
-  if (left) node.children.push(left);
+  const left  = buildTree(rng, a1, len * lf, depth - 1, treeMaxDepth, level + 1);
+  const right = buildTree(rng, a2, len * lf, depth - 1, treeMaxDepth, level + 1);
+  if (left)  node.children.push(left);
   if (right) node.children.push(right);
   if (depth > 3 && rng() < 0.30) {
-    const extra = buildTree(rng, angle + (rng() - 0.5) * 0.5, len * (lf - 0.15), depth - 2);
+    const extra = buildTree(rng, angle + (rng() - 0.5) * 0.5, len * (lf - 0.15), depth - 2, treeMaxDepth, level + 1);
     if (extra) node.children.push(extra);
   }
   if (depth <= 2) {
     const count = 4 + (rng() * 6 | 0);
     for (let i = 0; i < count; i++) {
+      // pre-generate flower colour per leaf so draw is deterministic
+      const ft = rng() < 0.4 ? 0 : rng() < 0.55 ? 1 : 2; // 0=rose, 1=cream, 2=lavender
       node.leaves.push({
         ox: (rng() - 0.5) * 22,
         oy: (rng() - 0.5) * 22,
-        r: 3 + rng() * 5,
-        g: 65 + (rng() * 55 | 0)
+        r:  3 + rng() * 5,
+        g:  65 + (rng() * 55 | 0),
+        fr: ft === 0 ? 205 + (rng()*50|0) : ft === 1 ? 245 + (rng()*10|0) : 180 + (rng()*45|0),
+        fg: ft === 0 ? 125 + (rng()*75|0) : ft === 1 ? 232 + (rng()*20|0) : 125 + (rng()*55|0),
+        fb: ft === 0 ? 155 + (rng()*75|0) : ft === 1 ? 238 + (rng()*17|0) : 205 + (rng()*50|0),
       });
     }
   }
   return node;
 }
 
-function drawTree(node, x, y, t, wind, flash) {
+// 5-petal daisy — petals as rotated ellipses pointing radially outward
+function drawFlower(cx, cy, size, fr, fg, fb, alpha) {
+  for (let i = 0; i < 5; i++) {
+    const pa = (i / 5) * Math.PI * 2;
+    ctx.beginPath();
+    ctx.ellipse(
+      cx + Math.cos(pa) * size * 0.70,
+      cy + Math.sin(pa) * size * 0.70,
+      size * 0.40, size * 0.25, pa, 0, Math.PI * 2
+    );
+    ctx.fillStyle = `rgba(${fr},${fg},${fb},${alpha})`;
+    ctx.fill();
+  }
+  ctx.beginPath();
+  ctx.arc(cx, cy, size * 0.28, 0, Math.PI * 2);
+  ctx.fillStyle = `rgba(255,215,40,${alpha * 0.95})`;
+  ctx.fill();
+}
+
+// lc = { stage, progress, flash }
+// tipCollector: array to push leaf-tip world positions into (for particle spawning)
+function drawTree(node, x, y, t, wind, lc, tipCollector) {
+  // BIRTH: reveal branches level by level, frontier grows smoothly
+  let branchLen = node.len;
+  if (lc.stage === S_BIRTH) {
+    const appear     = node.level / node.treeMaxDepth;
+    const nextAppear = (node.level + 1) / node.treeMaxDepth;
+    if (lc.progress <= appear) return;
+    if (lc.progress < nextAppear)
+      branchLen = node.len * (lc.progress - appear) / (nextAppear - appear);
+  }
+
   const sway = Math.sin(t * 0.0016 + node.swayPhase) * node.swayAmt * wind;
-  const a = node.angle + sway;
-  const ex = x + Math.cos(a) * node.len;
-  const ey = y + Math.sin(a) * node.len;
-  const flb = flash * 65;
-  const g = 16 + (8 - node.depth) * 14;
+  const a  = node.angle + sway;
+  const ex = x + Math.cos(a) * branchLen;
+  const ey = y + Math.sin(a) * branchLen;
+
+  // Branch colour — desaturates to grey during dying
+  const baseG = 16 + (node.treeMaxDepth - node.depth) * 12;
+  const flb = lc.flash * 65;
+  let brR = 12, brG = baseG, brB = 6;
+  if (lc.stage === S_BIRTH) {
+    brG = Math.min(255, baseG + 20); brB = 14; // young green
+  } else if (lc.stage === S_DYING) {
+    const p = lc.progress;
+    brR = (12 + p * 50) | 0;
+    brG = Math.max(brR - 5, (baseG - p * 20) | 0);
+    brB = (6 + p * 40) | 0;
+  } else if (lc.stage === S_DEAD) {
+    brR = 50; brG = 44; brB = 36;
+  }
+
   ctx.lineWidth = Math.max(0.5, node.depth * 1.3);
-  ctx.strokeStyle = `rgb(${12 + flb * 0.22 | 0},${g + flb * 0.32 | 0},6)`;
+  ctx.strokeStyle = `rgb(${brR + (flb*0.22)|0},${brG + (flb*0.32)|0},${brB})`;
   ctx.beginPath();
   ctx.moveTo(x, y);
   ctx.lineTo(ex, ey);
   ctx.stroke();
+
+  // Leaves / flowers
   if (node.leaves.length) {
-    node.leaves.forEach(l => {
-      ctx.beginPath();
-      ctx.arc(ex + l.ox, ey + l.oy, l.r, 0, Math.PI * 2);
-      ctx.fillStyle = `rgba(7,${l.g + flb * 0.28 | 0},7,0.62)`;
-      ctx.fill();
-    });
+    const s = lc.stage, p = lc.progress;
+    if (s === S_LEAFY || s === S_FLOWERING || s === S_FALLING) {
+      node.leaves.forEach(l => {
+        if (s === S_FLOWERING) {
+          const fflb = flb * 0.018;
+          drawFlower(
+            ex + l.ox, ey + l.oy, l.r * 1.55,
+            Math.min(255, l.fr + fflb) | 0,
+            Math.min(255, l.fg + fflb * 0.5) | 0,
+            Math.min(255, l.fb + fflb * 0.3) | 0,
+            0.84
+          );
+        } else if (s === S_FALLING) {
+          const r = Math.min(255, (8  + p * 168) | 0);
+          const g = Math.max(15,  (l.g - p * 52) | 0);
+          const alpha = Math.max(0, (1 - p * 0.93) * 0.65);
+          ctx.beginPath();
+          ctx.arc(ex + l.ox, ey + l.oy, l.r, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${r + (flb*0.18)|0},${g + (flb*0.22)|0},5,${alpha})`;
+          ctx.fill();
+        } else {
+          ctx.beginPath();
+          ctx.arc(ex + l.ox, ey + l.oy, l.r, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${8 + (flb*0.22)|0},${l.g + (flb*0.28)|0},8,0.62)`;
+          ctx.fill();
+        }
+      });
+    }
+    if (tipCollector) tipCollector.push({ x: ex, y: ey });
   }
-  node.children.forEach(c => drawTree(c, ex, ey, t, wind, flash));
+
+  node.children.forEach(c => drawTree(c, ex, ey, t, wind, lc, tipCollector));
+}
+
+// ===== LIFECYCLE UPDATE =====
+function updateLifecycle(tree, curWind) {
+  const lc = tree.lc;
+  lc.stageTimer++;
+  lc.progress = Math.min(1, lc.stageTimer / S_DUR[lc.stage]);
+
+  // Spawn falling-leaf particles from last frame's tip positions
+  if (lc.stage === S_FALLING && lc.tips.length > 0 && lc.particles.length < 250) {
+    const rate = 0.04 + lc.progress * 0.20;
+    if (Math.random() < rate) {
+      const tip = lc.tips[Math.floor(Math.random() * lc.tips.length)];
+      lc.particles.push({
+        x: tip.x + (Math.random() - 0.5) * 10,
+        y: tip.y,
+        vx: (Math.random() - 0.5) * 1.5,
+        vy: -0.5 + Math.random() * 0.7,
+        rot: Math.random() * Math.PI * 2,
+        rotS: (Math.random() - 0.5) * 0.14,
+        alpha: 0.65 + Math.random() * 0.30,
+        decay: 0.0022 + Math.random() * 0.004,
+        size: 2.5 + Math.random() * 3.5,
+        r: 105 + Math.random() * 140 | 0,
+        g:  25 + Math.random() *  65 | 0,
+      });
+    }
+  }
+
+  // Physics for all particles (keep running after FALLING ends so leaves settle)
+  const alive = [];
+  for (const p of lc.particles) {
+    p.x  += p.vx + curWind * 0.20;
+    p.vy += 0.055;
+    p.y  += p.vy;
+    p.vx *= 0.98;
+    p.rot += p.rotS;
+    p.alpha -= p.decay;
+    if (p.alpha > 0.01 && p.y < H + 40) alive.push(p);
+  }
+  lc.particles = alive;
+
+  // Advance stage
+  if (lc.stageTimer >= S_DUR[lc.stage]) {
+    lc.stage = (lc.stage + 1) % S_COUNT;
+    lc.stageTimer = 0;
+    lc.progress = 0;
+    if (lc.stage === S_BIRTH) {
+      // Regrow with a new seed variation so each lifecycle looks different
+      tree.currentSeed = (tree.currentSeed + 97) % 99991;
+      tree.root = buildTree(
+        makeRng(tree.currentSeed),
+        -Math.PI / 2, tree.def.len, tree.def.depth, tree.def.depth, 0
+      );
+      lc.particles = [];
+      lc.tips = [];
+    }
+  }
 }
 
 // ===== FERN =====
@@ -92,8 +240,7 @@ function buildFern(rng, angle, len, depth) {
     angle, len, depth,
     swayPhase: rng() * Math.PI * 2,
     swayAmt: 0.11 / Math.sqrt(depth),
-    children: [],
-    midChildren: []
+    children: [], midChildren: []
   };
   const tip1 = buildFern(rng, angle - 0.52, len * lf, depth - 1);
   const tip2 = buildFern(rng, angle + 0.52, len * lf, depth - 1);
@@ -111,20 +258,18 @@ function buildFern(rng, angle, len, depth) {
 
 function drawFern(node, x, y, t, wind, flash) {
   const sway = Math.sin(t * 0.0020 + node.swayPhase) * node.swayAmt * wind;
-  const a = node.angle + sway;
+  const a  = node.angle + sway;
   const ex = x + Math.cos(a) * node.len;
   const ey = y + Math.sin(a) * node.len;
-  const mx = (x + ex) * 0.5;
-  const my = (y + ey) * 0.5;
+  const mx = (x + ex) * 0.5, my = (y + ey) * 0.5;
   const flb = flash * 45;
   ctx.lineWidth = Math.max(0.3, node.depth * 0.45);
-  ctx.strokeStyle = `rgba(${8 + flb * 0.18 | 0},${52 + flb * 0.28 | 0},12,0.9)`;
+  ctx.strokeStyle = `rgba(${8 + flb*0.18|0},${52 + flb*0.28|0},12,0.9)`;
   ctx.beginPath();
-  ctx.moveTo(x, y);
-  ctx.lineTo(ex, ey);
+  ctx.moveTo(x, y); ctx.lineTo(ex, ey);
   ctx.stroke();
   node.midChildren.forEach(c => drawFern(c, mx, my, t, wind, flash));
-  node.children.forEach(c => drawFern(c, ex, ey, t, wind, flash));
+  node.children.forEach(c    => drawFern(c, ex, ey, t, wind, flash));
 }
 
 // ===== SCENE =====
@@ -139,12 +284,25 @@ const treeDefs = [
 ];
 
 function buildScene() {
-  const treeList = treeDefs.map(d => ({
-    x: W * d.xf,
-    y: H,
-    root: buildTree(makeRng(d.seed), -Math.PI / 2, d.len, d.depth),
-    wp: Math.random() * Math.PI * 2
-  }));
+  const treeList = treeDefs.map(d => {
+    const initStage = Math.floor(Math.random() * S_COUNT);
+    const initTimer = Math.floor(Math.random() * S_DUR[initStage]);
+    return {
+      x: W * d.xf, y: H,
+      def: d,
+      currentSeed: d.seed,
+      root: buildTree(makeRng(d.seed), -Math.PI / 2, d.len, d.depth, d.depth, 0),
+      wp: Math.random() * Math.PI * 2,
+      lc: {
+        stage: initStage,
+        stageTimer: initTimer,
+        progress: initTimer / S_DUR[initStage],
+        particles: [],
+        tips: [],
+        leanDir: Math.random() < 0.5 ? 1 : -1,
+      }
+    };
+  });
 
   const FERN_COUNT = 22;
   const fernList = Array.from({ length: FERN_COUNT }, (_, i) => {
@@ -173,8 +331,7 @@ let scene = buildScene();
 
 // ===== RAIN =====
 const drops = Array.from({ length: 480 }, () => ({
-  x: Math.random() * W,
-  y: Math.random() * H,
+  x: Math.random() * W, y: Math.random() * H,
   len: 10 + Math.random() * 22,
   speed: 11 + Math.random() * 9,
   a: 0.05 + Math.random() * 0.22
@@ -205,21 +362,16 @@ function makeBolt(x, y, ang, depth) {
     segs.push(...makeBolt(nx, ny, ang + (Math.random() - 0.5) * 1.7, depth - 2));
   return segs;
 }
-
-let boltSegs = [];
-let flash = 0;
-let boltNext = 100 + Math.random() * 220;
-let boltTimer = 0;
+let boltSegs = [], flash = 0;
+let boltNext = 100 + Math.random() * 220, boltTimer = 0;
 
 // ===== WIND =====
 let wind = 2.5, windGoal = 2.5, windTick = 0;
 
-// ===== STARS (dim, behind clouds) =====
+// ===== STARS =====
 const stars = Array.from({ length: 80 }, () => ({
-  x: Math.random() * W,
-  y: Math.random() * H * 0.45,
-  r: 0.5 + Math.random() * 1.0,
-  a: 0.1 + Math.random() * 0.3
+  x: Math.random() * W, y: Math.random() * H * 0.45,
+  r: 0.5 + Math.random() * 1.0, a: 0.1 + Math.random() * 0.3
 }));
 
 // ===== MAIN LOOP =====
@@ -228,14 +380,13 @@ let t = 0;
 function frame() {
   t++;
 
-  // Wind gusts
   if (--windTick <= 0) {
     windGoal = 1.0 + Math.random() * 5.8;
     windTick = 55 + Math.random() * 150;
   }
   wind += (windGoal - wind) * 0.012;
 
-  // Sky gradient — brightens on lightning flash
+  // Sky
   const fl = flash;
   const skyGrd = ctx.createLinearGradient(0, 0, 0, H);
   skyGrd.addColorStop(0,   `rgb(${4  + fl*38|0},${4  + fl*30|0},${18 + fl*26|0})`);
@@ -244,111 +395,126 @@ function frame() {
   ctx.fillStyle = skyGrd;
   ctx.fillRect(0, 0, W, H);
 
-  // Stars (barely visible through clouds)
   stars.forEach(s => {
-    ctx.beginPath();
-    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
     ctx.fillStyle = `rgba(200,210,240,${s.a * (1 - fl)})`;
     ctx.fill();
   });
 
-  // Clouds
   clouds.forEach(c => {
     c.x += c.spd;
     if (c.x > W + 380) c.x = -380;
     c.blobs.forEach(b => {
       const cg = ctx.createRadialGradient(c.x+b.dx, c.y+b.dy, 0, c.x+b.dx, c.y+b.dy, b.r);
-      cg.addColorStop(0,    `rgba(14,14,28,0.90)`);
-      cg.addColorStop(0.55, `rgba(9,9,20,0.52)`);
-      cg.addColorStop(1,    `rgba(4,4,14,0)`);
+      cg.addColorStop(0,    'rgba(14,14,28,0.90)');
+      cg.addColorStop(0.55, 'rgba(9,9,20,0.52)');
+      cg.addColorStop(1,    'rgba(4,4,14,0)');
       ctx.fillStyle = cg;
-      ctx.beginPath();
-      ctx.arc(c.x+b.dx, c.y+b.dy, b.r, 0, Math.PI * 2);
+      ctx.beginPath(); ctx.arc(c.x+b.dx, c.y+b.dy, b.r, 0, Math.PI * 2);
       ctx.fill();
     });
   });
 
-  // Rain streaks angled by wind
   const wx = wind * 1.05;
   drops.forEach(d => {
-    d.y += d.speed;
-    d.x += wx;
+    d.y += d.speed; d.x += wx;
     if (d.y > H + 28) { d.y = -18; d.x = Math.random() * (W + 100) - 50; }
     if (d.x > W + 35) d.x -= W + 70;
     ctx.strokeStyle = `rgba(150,188,230,${d.a})`;
     ctx.lineWidth = 0.5;
-    ctx.beginPath();
-    ctx.moveTo(d.x, d.y);
-    ctx.lineTo(d.x + wx * 0.85, d.y + d.len);
+    ctx.beginPath(); ctx.moveTo(d.x, d.y); ctx.lineTo(d.x + wx * 0.85, d.y + d.len);
     ctx.stroke();
   });
 
-  // Lightning bolt
   if (++boltTimer >= boltNext) {
     boltTimer = 0;
     boltNext = 80 + Math.random() * 380;
-    boltSegs = makeBolt(
-      W * (0.08 + Math.random() * 0.84), 0,
-      Math.PI / 2 + (Math.random() - 0.5) * 0.55,
-      7
-    );
+    boltSegs = makeBolt(W * (0.08 + Math.random() * 0.84), 0,
+      Math.PI / 2 + (Math.random() - 0.5) * 0.55, 7);
     flash = 1.0;
   }
   if (flash > 0.04) {
     ctx.save();
-    ctx.shadowBlur = 32;
-    ctx.shadowColor = 'rgba(165,210,255,0.88)';
+    ctx.shadowBlur = 32; ctx.shadowColor = 'rgba(165,210,255,0.88)';
     boltSegs.forEach(s => {
       ctx.strokeStyle = `rgba(225,242,255,${Math.min(1, flash * 1.4)})`;
       ctx.lineWidth = Math.max(0.4, s.w * 0.65);
-      ctx.beginPath();
-      ctx.moveTo(s.x1, s.y1);
-      ctx.lineTo(s.x2, s.y2);
+      ctx.beginPath(); ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2);
       ctx.stroke();
     });
     ctx.restore();
     flash *= 0.85;
   }
 
-  // Trees
+  // Trees — each has its own lifecycle
   scene.treeList.forEach(tr => {
+    updateLifecycle(tr, wind);
+    const lc = tr.lc;
     const w = wind * (0.85 + Math.sin(t * 0.0009 + tr.wp) * 0.25);
-    drawTree(tr.root, tr.x, tr.y, t, w, flash);
+
+    // Collect tip positions this frame for next-frame particle spawning
+    const tips = (lc.stage === S_FALLING) ? [] : null;
+
+    // Dying: lean sideways and fade; dead: near-invisible
+    const alpha = lc.stage === S_DYING ? (1 - lc.progress * 0.68)
+                : lc.stage === S_DEAD  ? Math.max(0, 0.30 - lc.progress * 0.30)
+                : 1;
+    const lean  = lc.stage === S_DYING ? lc.leanDir * lc.progress * 0.40
+                : lc.stage === S_DEAD  ? lc.leanDir * 0.40
+                : 0;
+
+    ctx.save();
+    if (alpha < 1) ctx.globalAlpha = alpha;
+    if (lean !== 0) {
+      ctx.translate(tr.x, tr.y);
+      ctx.rotate(lean);
+      ctx.translate(-tr.x, -tr.y);
+    }
+    drawTree(tr.root, tr.x, tr.y, t, w, { stage: lc.stage, progress: lc.progress, flash }, tips);
+    ctx.restore();
+
+    if (tips) lc.tips = tips;
+
+    // Draw falling leaf particles
+    lc.particles.forEach(p => {
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = `rgba(${p.r},${p.g},5,${p.alpha})`;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, p.size * 0.52, p.size, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    });
   });
 
-  // Ferns
   scene.fernList.forEach(fr => {
     const w = wind * (0.88 + Math.sin(t * 0.0013 + fr.wp) * 0.22);
     drawFern(fr.root, fr.x, fr.y, t, w, flash);
   });
 
-  // Grass blades
   scene.grassList.forEach(g => {
     const sway = Math.sin(t * 0.0024 + g.phase) * wind * 5.2;
     const flb = flash * 48;
     ctx.lineWidth = g.lw;
-    ctx.strokeStyle = `rgba(${11 + flb * 0.18|0},${g.g + flb * 0.28|0},11,0.85)`;
+    ctx.strokeStyle = `rgba(${11 + flb*0.18|0},${g.g + flb*0.28|0},11,0.85)`;
     ctx.beginPath();
     ctx.moveTo(g.x, g.y);
     ctx.quadraticCurveTo(g.x + sway * 0.42, g.y - g.h * 0.58, g.x + sway, g.y - g.h);
     ctx.stroke();
   });
 
-  // Puddle shimmer on ground
   if (flash > 0.15) {
-    const puddleGrd = ctx.createLinearGradient(0, H - 12, 0, H);
-    puddleGrd.addColorStop(0, `rgba(30,60,80,0)`);
-    puddleGrd.addColorStop(1, `rgba(20,50,70,${flash * 0.35})`);
-    ctx.fillStyle = puddleGrd;
-    ctx.fillRect(0, H - 12, W, 12);
+    const pg = ctx.createLinearGradient(0, H - 12, 0, H);
+    pg.addColorStop(0, 'rgba(30,60,80,0)');
+    pg.addColorStop(1, `rgba(20,50,70,${flash * 0.35})`);
+    ctx.fillStyle = pg; ctx.fillRect(0, H - 12, W, 12);
   }
 
-  // Ground shadow vignette
   const gg = ctx.createLinearGradient(0, H - 60, 0, H);
   gg.addColorStop(0, 'rgba(2,8,2,0)');
   gg.addColorStop(1, 'rgba(2,5,2,1)');
-  ctx.fillStyle = gg;
-  ctx.fillRect(0, H - 60, W, 60);
+  ctx.fillStyle = gg; ctx.fillRect(0, H - 60, W, 60);
 
   requestAnimationFrame(frame);
 }
