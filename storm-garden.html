@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Storm Garden</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { overflow: hidden; background: #000; }
+canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = canvas.width = window.innerWidth;
+let H = canvas.height = window.innerHeight;
+
+// Seeded LCG — keeps tree shapes stable across frames
+function makeRng(seed) {
+  let s = (seed ^ 0x12345678) >>> 0;
+  return () => {
+    s = (Math.imul(1664525, s) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+}
+
+// ===== TREE =====
+function buildTree(rng, angle, len, depth) {
+  if (depth <= 0 || len < 2) return null;
+  const lf = 0.60 + rng() * 0.15;
+  const a1 = angle - (0.25 + rng() * 0.30);
+  const a2 = angle + (0.25 + rng() * 0.30);
+  const node = {
+    angle, len, depth,
+    swayPhase: rng() * Math.PI * 2,
+    swayAmt: 0.06 / Math.sqrt(depth),
+    children: [],
+    leaves: []
+  };
+  const left = buildTree(rng, a1, len * lf, depth - 1);
+  const right = buildTree(rng, a2, len * lf, depth - 1);
+  if (left) node.children.push(left);
+  if (right) node.children.push(right);
+  if (depth > 3 && rng() < 0.30) {
+    const extra = buildTree(rng, angle + (rng() - 0.5) * 0.5, len * (lf - 0.15), depth - 2);
+    if (extra) node.children.push(extra);
+  }
+  if (depth <= 2) {
+    const count = 4 + (rng() * 6 | 0);
+    for (let i = 0; i < count; i++) {
+      node.leaves.push({
+        ox: (rng() - 0.5) * 22,
+        oy: (rng() - 0.5) * 22,
+        r: 3 + rng() * 5,
+        g: 65 + (rng() * 55 | 0)
+      });
+    }
+  }
+  return node;
+}
+
+function drawTree(node, x, y, t, wind, flash) {
+  const sway = Math.sin(t * 0.0016 + node.swayPhase) * node.swayAmt * wind;
+  const a = node.angle + sway;
+  const ex = x + Math.cos(a) * node.len;
+  const ey = y + Math.sin(a) * node.len;
+  const flb = flash * 65;
+  const g = 16 + (8 - node.depth) * 14;
+  ctx.lineWidth = Math.max(0.5, node.depth * 1.3);
+  ctx.strokeStyle = `rgb(${12 + flb * 0.22 | 0},${g + flb * 0.32 | 0},6)`;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(ex, ey);
+  ctx.stroke();
+  if (node.leaves.length) {
+    node.leaves.forEach(l => {
+      ctx.beginPath();
+      ctx.arc(ex + l.ox, ey + l.oy, l.r, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(7,${l.g + flb * 0.28 | 0},7,0.62)`;
+      ctx.fill();
+    });
+  }
+  node.children.forEach(c => drawTree(c, ex, ey, t, wind, flash));
+}
+
+// ===== FERN =====
+function buildFern(rng, angle, len, depth) {
+  if (depth <= 0 || len < 2) return null;
+  const lf = 0.56 + rng() * 0.10;
+  const node = {
+    angle, len, depth,
+    swayPhase: rng() * Math.PI * 2,
+    swayAmt: 0.11 / Math.sqrt(depth),
+    children: [],
+    midChildren: []
+  };
+  const tip1 = buildFern(rng, angle - 0.52, len * lf, depth - 1);
+  const tip2 = buildFern(rng, angle + 0.52, len * lf, depth - 1);
+  if (tip1) node.children.push(tip1);
+  if (tip2) node.children.push(tip2);
+  if (depth > 2) {
+    const sl = len * lf * 0.48;
+    const f1 = buildFern(rng, angle - 1.15, sl, depth - 2);
+    const f2 = buildFern(rng, angle + 1.15, sl, depth - 2);
+    if (f1) node.midChildren.push(f1);
+    if (f2) node.midChildren.push(f2);
+  }
+  return node;
+}
+
+function drawFern(node, x, y, t, wind, flash) {
+  const sway = Math.sin(t * 0.0020 + node.swayPhase) * node.swayAmt * wind;
+  const a = node.angle + sway;
+  const ex = x + Math.cos(a) * node.len;
+  const ey = y + Math.sin(a) * node.len;
+  const mx = (x + ex) * 0.5;
+  const my = (y + ey) * 0.5;
+  const flb = flash * 45;
+  ctx.lineWidth = Math.max(0.3, node.depth * 0.45);
+  ctx.strokeStyle = `rgba(${8 + flb * 0.18 | 0},${52 + flb * 0.28 | 0},12,0.9)`;
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(ex, ey);
+  ctx.stroke();
+  node.midChildren.forEach(c => drawFern(c, mx, my, t, wind, flash));
+  node.children.forEach(c => drawFern(c, ex, ey, t, wind, flash));
+}
+
+// ===== SCENE =====
+const treeDefs = [
+  { xf: 0.04, seed: 1,  depth: 7, len: 100 },
+  { xf: 0.18, seed: 42, depth: 8, len: 120 },
+  { xf: 0.36, seed: 7,  depth: 6, len: 85  },
+  { xf: 0.55, seed: 13, depth: 8, len: 115 },
+  { xf: 0.72, seed: 99, depth: 7, len: 95  },
+  { xf: 0.88, seed: 5,  depth: 6, len: 72  },
+  { xf: 0.96, seed: 33, depth: 5, len: 58  },
+];
+
+function buildScene() {
+  const treeList = treeDefs.map(d => ({
+    x: W * d.xf,
+    y: H,
+    root: buildTree(makeRng(d.seed), -Math.PI / 2, d.len, d.depth),
+    wp: Math.random() * Math.PI * 2
+  }));
+
+  const FERN_COUNT = 22;
+  const fernList = Array.from({ length: FERN_COUNT }, (_, i) => {
+    const rng = makeRng(i * 31 + 7);
+    return {
+      x: ((i + rng() * 0.6) / FERN_COUNT) * W,
+      y: H - rng() * 16,
+      root: buildFern(makeRng(i * 17 + 3), -Math.PI / 2, 28, 5),
+      wp: Math.random() * Math.PI * 2
+    };
+  });
+
+  const grassList = Array.from({ length: 320 }, () => ({
+    x: Math.random() * W,
+    y: H - Math.random() * 20,
+    h: 14 + Math.random() * 42,
+    phase: Math.random() * Math.PI * 2,
+    lw: 0.4 + Math.random() * 1.3,
+    g: 50 + Math.random() * 45 | 0
+  }));
+
+  return { treeList, fernList, grassList };
+}
+
+let scene = buildScene();
+
+// ===== RAIN =====
+const drops = Array.from({ length: 480 }, () => ({
+  x: Math.random() * W,
+  y: Math.random() * H,
+  len: 10 + Math.random() * 22,
+  speed: 11 + Math.random() * 9,
+  a: 0.05 + Math.random() * 0.22
+}));
+
+// ===== CLOUDS =====
+const clouds = Array.from({ length: 8 }, () => ({
+  x: Math.random() * W,
+  y: 15 + Math.random() * H * 0.32,
+  spd: 0.10 + Math.random() * 0.40,
+  blobs: Array.from({ length: 5 + Math.random() * 7 | 0 }, () => ({
+    dx: (Math.random() - 0.5) * 290,
+    dy: (Math.random() - 0.5) * 85,
+    r: 55 + Math.random() * 95
+  }))
+}));
+
+// ===== LIGHTNING =====
+function makeBolt(x, y, ang, depth) {
+  if (depth <= 0) return [];
+  const len = 40 + Math.random() * 95;
+  const jitter = (Math.random() - 0.5) * 1.1;
+  const nx = x + Math.cos(ang + jitter) * len;
+  const ny = y + Math.sin(ang + jitter) * len;
+  const segs = [{ x1: x, y1: y, x2: nx, y2: ny, w: depth }];
+  segs.push(...makeBolt(nx, ny, ang + (Math.random() - 0.5) * 0.55, depth - 1));
+  if (depth > 2 && Math.random() < 0.45)
+    segs.push(...makeBolt(nx, ny, ang + (Math.random() - 0.5) * 1.7, depth - 2));
+  return segs;
+}
+
+let boltSegs = [];
+let flash = 0;
+let boltNext = 100 + Math.random() * 220;
+let boltTimer = 0;
+
+// ===== WIND =====
+let wind = 2.5, windGoal = 2.5, windTick = 0;
+
+// ===== STARS (dim, behind clouds) =====
+const stars = Array.from({ length: 80 }, () => ({
+  x: Math.random() * W,
+  y: Math.random() * H * 0.45,
+  r: 0.5 + Math.random() * 1.0,
+  a: 0.1 + Math.random() * 0.3
+}));
+
+// ===== MAIN LOOP =====
+let t = 0;
+
+function frame() {
+  t++;
+
+  // Wind gusts
+  if (--windTick <= 0) {
+    windGoal = 1.0 + Math.random() * 5.8;
+    windTick = 55 + Math.random() * 150;
+  }
+  wind += (windGoal - wind) * 0.012;
+
+  // Sky gradient — brightens on lightning flash
+  const fl = flash;
+  const skyGrd = ctx.createLinearGradient(0, 0, 0, H);
+  skyGrd.addColorStop(0,   `rgb(${4  + fl*38|0},${4  + fl*30|0},${18 + fl*26|0})`);
+  skyGrd.addColorStop(0.5, `rgb(${7  + fl*28|0},${9  + fl*22|0},${22 + fl*18|0})`);
+  skyGrd.addColorStop(1,   `rgb(${5  + fl*18|0},${13 + fl*16|0},${5  + fl*10|0})`);
+  ctx.fillStyle = skyGrd;
+  ctx.fillRect(0, 0, W, H);
+
+  // Stars (barely visible through clouds)
+  stars.forEach(s => {
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(200,210,240,${s.a * (1 - fl)})`;
+    ctx.fill();
+  });
+
+  // Clouds
+  clouds.forEach(c => {
+    c.x += c.spd;
+    if (c.x > W + 380) c.x = -380;
+    c.blobs.forEach(b => {
+      const cg = ctx.createRadialGradient(c.x+b.dx, c.y+b.dy, 0, c.x+b.dx, c.y+b.dy, b.r);
+      cg.addColorStop(0,    `rgba(14,14,28,0.90)`);
+      cg.addColorStop(0.55, `rgba(9,9,20,0.52)`);
+      cg.addColorStop(1,    `rgba(4,4,14,0)`);
+      ctx.fillStyle = cg;
+      ctx.beginPath();
+      ctx.arc(c.x+b.dx, c.y+b.dy, b.r, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  });
+
+  // Rain streaks angled by wind
+  const wx = wind * 1.05;
+  drops.forEach(d => {
+    d.y += d.speed;
+    d.x += wx;
+    if (d.y > H + 28) { d.y = -18; d.x = Math.random() * (W + 100) - 50; }
+    if (d.x > W + 35) d.x -= W + 70;
+    ctx.strokeStyle = `rgba(150,188,230,${d.a})`;
+    ctx.lineWidth = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(d.x, d.y);
+    ctx.lineTo(d.x + wx * 0.85, d.y + d.len);
+    ctx.stroke();
+  });
+
+  // Lightning bolt
+  if (++boltTimer >= boltNext) {
+    boltTimer = 0;
+    boltNext = 80 + Math.random() * 380;
+    boltSegs = makeBolt(
+      W * (0.08 + Math.random() * 0.84), 0,
+      Math.PI / 2 + (Math.random() - 0.5) * 0.55,
+      7
+    );
+    flash = 1.0;
+  }
+  if (flash > 0.04) {
+    ctx.save();
+    ctx.shadowBlur = 32;
+    ctx.shadowColor = 'rgba(165,210,255,0.88)';
+    boltSegs.forEach(s => {
+      ctx.strokeStyle = `rgba(225,242,255,${Math.min(1, flash * 1.4)})`;
+      ctx.lineWidth = Math.max(0.4, s.w * 0.65);
+      ctx.beginPath();
+      ctx.moveTo(s.x1, s.y1);
+      ctx.lineTo(s.x2, s.y2);
+      ctx.stroke();
+    });
+    ctx.restore();
+    flash *= 0.85;
+  }
+
+  // Trees
+  scene.treeList.forEach(tr => {
+    const w = wind * (0.85 + Math.sin(t * 0.0009 + tr.wp) * 0.25);
+    drawTree(tr.root, tr.x, tr.y, t, w, flash);
+  });
+
+  // Ferns
+  scene.fernList.forEach(fr => {
+    const w = wind * (0.88 + Math.sin(t * 0.0013 + fr.wp) * 0.22);
+    drawFern(fr.root, fr.x, fr.y, t, w, flash);
+  });
+
+  // Grass blades
+  scene.grassList.forEach(g => {
+    const sway = Math.sin(t * 0.0024 + g.phase) * wind * 5.2;
+    const flb = flash * 48;
+    ctx.lineWidth = g.lw;
+    ctx.strokeStyle = `rgba(${11 + flb * 0.18|0},${g.g + flb * 0.28|0},11,0.85)`;
+    ctx.beginPath();
+    ctx.moveTo(g.x, g.y);
+    ctx.quadraticCurveTo(g.x + sway * 0.42, g.y - g.h * 0.58, g.x + sway, g.y - g.h);
+    ctx.stroke();
+  });
+
+  // Puddle shimmer on ground
+  if (flash > 0.15) {
+    const puddleGrd = ctx.createLinearGradient(0, H - 12, 0, H);
+    puddleGrd.addColorStop(0, `rgba(30,60,80,0)`);
+    puddleGrd.addColorStop(1, `rgba(20,50,70,${flash * 0.35})`);
+    ctx.fillStyle = puddleGrd;
+    ctx.fillRect(0, H - 12, W, 12);
+  }
+
+  // Ground shadow vignette
+  const gg = ctx.createLinearGradient(0, H - 60, 0, H);
+  gg.addColorStop(0, 'rgba(2,8,2,0)');
+  gg.addColorStop(1, 'rgba(2,5,2,1)');
+  ctx.fillStyle = gg;
+  ctx.fillRect(0, H - 60, W, 60);
+
+  requestAnimationFrame(frame);
+}
+
+frame();
+
+window.addEventListener('resize', () => {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  scene = buildScene();
+});
+</script>
+</body>
+</html>
